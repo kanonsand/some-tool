@@ -98,6 +98,7 @@ public class KafkaManageTool extends ClosableHolder {
             printError(e);
         } finally {
             EXECUTOR_SERVICE.shutdownNow();
+            cleanUp();
         }
 
     }
