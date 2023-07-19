@@ -2,8 +2,9 @@ package org.example.kafkatool;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
+import org.apache.commons.lang3.tuple.ImmutableTriple;
+import org.apache.commons.lang3.tuple.Triple;
 import org.apache.kafka.clients.admin.*;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.Node;
@@ -19,7 +20,7 @@ import java.util.stream.Collectors;
 
 import static org.example.PrintUtil.*;
 
-public class KafkaManageTool extends ClosableHolder{
+public class KafkaManageTool extends ClosableHolder {
 
     private final ExecutorService EXECUTOR_SERVICE = new ThreadPoolExecutor(3,
             3, 60L, TimeUnit.SECONDS,
@@ -72,7 +73,7 @@ public class KafkaManageTool extends ClosableHolder{
                 input = input.trim();
                 String[] split = input.split("\\s+");
                 HAS_RUNNING_TASK.set(true);
-                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> handleInput(split, adminClient), EXECUTOR_SERVICE);
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> executeCommand(split, adminClient), EXECUTOR_SERVICE);
                 while (true) {
                     try {
                         future.get();
@@ -107,10 +108,11 @@ public class KafkaManageTool extends ClosableHolder{
         return KafkaAdminClient.create(properties);
     }
 
-    private void handleInput(String[] param,AdminClient adminClient) {
+    private void executeCommand(String[] param, AdminClient adminClient) {
         String action = param[0];
         if (!ACTION_MAP.containsKey(action)) {
             printInfo(String.format("unknown command %s", action));
+            printInfo("valid command" + ACTION_MAP.keySet().stream().sorted().collect(Collectors.toList()));
             return;
         }
         BiConsumer<String[], AdminClient> adminClientBiConsumer = ACTION_MAP.get(action);
@@ -122,19 +124,13 @@ public class KafkaManageTool extends ClosableHolder{
             NEED_EXIT.set(true);
         });
         ACTION_MAP.put("info", (params, client) -> {
-            DescribeClusterOptions options = new DescribeClusterOptions();
-            options.includeAuthorizedOperations(false);
-            options.timeoutMs(10000);
-            DescribeClusterResult describeClusterResult = client.describeCluster(options);
             try {
+                DescribeClusterOptions options = new DescribeClusterOptions();
+                options.includeAuthorizedOperations(false);
+                options.timeoutMs(10000);
+                DescribeClusterResult describeClusterResult = client.describeCluster(options);
                 Node node = describeClusterResult.controller().get();
                 printInfo(node.toString());
-            } catch (Exception e) {
-                printError(e);
-            }
-            clearLine();
-
-            try {
                 Collection<Node> nodes = describeClusterResult.nodes().get();
                 nodes.stream().map(Node::toString).forEach(PrintUtil::printInfo);
             } catch (Exception e) {
@@ -178,13 +174,19 @@ public class KafkaManageTool extends ClosableHolder{
                     KafkaFuture<Collection<ConsumerGroupListing>> all = result.all();
                     Collection<ConsumerGroupListing> consumerGroupListings = all.get();
                     for (ConsumerGroupListing consumerGroupListing : consumerGroupListings) {
+                        Boolean listConsoleConsumer = KafkaToolConfig.getConfig("listConsoleConsumer");
+                        if (consumerGroupListing.isSimpleConsumerGroup() && !Optional.ofNullable(listConsoleConsumer).orElse(false)) {
+                            continue;
+                        }
                         printInfo(consumerGroupListing.toString());
-                        clearLine();
                     }
+                    clearLine();
                 } else {
                     Set<String> nameSet = new HashSet<>(Arrays.asList(params).subList(1, params.length));
                     DescribeConsumerGroupsResult result = client.describeConsumerGroups(nameSet);
                     Map<String, KafkaFuture<ConsumerGroupDescription>> map = result.describedGroups();
+                    Map<String, ConsumerGroupDescription> descrbeMap = result.all().get(1L, TimeUnit.MINUTES);
+                    descrbeMap.forEach((k, v) -> printInfo(k + " -> " + v));
                     for (Map.Entry<String, KafkaFuture<ConsumerGroupDescription>> entry : map.entrySet()) {
                         try {
                             ConsumerGroupDescription consumerGroupDescription = entry.getValue().get();
@@ -208,22 +210,30 @@ public class KafkaManageTool extends ClosableHolder{
                 ListConsumerGroupOffsetsOptions option = new ListConsumerGroupOffsetsOptions();
                 option.timeoutMs(10000);
                 String consumerGroupName = param[1];
+                //获取当前offset
                 ListConsumerGroupOffsetsResult result = client.listConsumerGroupOffsets(consumerGroupName, option);
-                Map<TopicPartition, OffsetAndMetadata> metaData = result.partitionsToOffsetAndMetadata().get();
-                KafkaConsumer<String, String> consumer = KafkaConsumerHolder.getConsumer(getHost(), getPort(), "test-tool", this);
-                Map<TopicPartition, Long> topicPartitionLongMap = consumer.endOffsets(metaData.keySet());
-                String format = "%-20s%-10s%-15s%-15s%-15s%-10s%s";
-                printInfo(String.format(format, "TOPIC", "PARTITION", "CURRENT_OFFSET", "END_OFFSET", "LAG", "EPOCH", "METADATA"));
-                metaData.forEach((k,v)->{
-                    String topic = k.topic();
-                    int partition = k.partition();
-                    long end = Optional.ofNullable(topicPartitionLongMap.get(k)).orElse(-1L);
-                    long offset = v.offset();
-                    int leaderEpoch = v.leaderEpoch().orElse(-1);
-                    String metadata = v.metadata();
-                    printInfo(String.format(format, topic, partition, offset, end, end - offset, leaderEpoch, metadata));
-                    clearLine();
+                Map<TopicPartition, OffsetAndMetadata> offsetAndMetadataMap = result.partitionsToOffsetAndMetadata().get();
+                //获取earliest
+                Map<TopicPartition, OffsetSpec> earliestOffsetSpec = offsetAndMetadataMap.keySet().stream().collect(Collectors.toMap(e -> e, e -> OffsetSpec.earliest()));
+                //获取latest
+                Map<TopicPartition, OffsetSpec> latestOffsetSpec = offsetAndMetadataMap.keySet().stream().collect(Collectors.toMap(e -> e, e -> OffsetSpec.latest()));
+
+                Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> earliestOffset = client.listOffsets(earliestOffsetSpec).all().get();
+                Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> latestOffset = client.listOffsets(latestOffsetSpec).all().get();
+                //整合结果
+                Map<TopicPartition, Triple<Long, Long, Long>> offsetMap = new HashMap<>();
+                offsetAndMetadataMap.forEach((k, v) -> {
+                    ListOffsetsResult.ListOffsetsResultInfo earliestInfo = earliestOffset.get(k);
+                    ListOffsetsResult.ListOffsetsResultInfo latestInfo = latestOffset.get(k);
+                    offsetMap.put(k, new ImmutableTriple<>(earliestInfo.offset(), v.offset(), latestInfo.offset()));
                 });
+
+                String offsetFormat = "%-20s%-10s%-20s%-20s%-20s%-15s%-15s";
+                printInfo(String.format(offsetFormat, "TOPIC", "PARTITION", "EARLIEST_OFFSET", "CURRENT_OFFSET", "END_OFFSET", "TO_HEAD", "LAG"));
+                offsetMap.forEach((k, v) ->
+                        printInfo(String.format(offsetFormat, k.topic(), k.partition(), v.getLeft(),
+                                v.getMiddle(), v.getRight(), v.getMiddle() - v.getLeft(), v.getRight() - v.getMiddle())));
+                clearLine();
             } catch (Exception e) {
                 printError(e);
             }
@@ -234,6 +244,18 @@ public class KafkaManageTool extends ClosableHolder{
             String collect = ACTION_MAP.keySet().stream().sorted().collect(Collectors.joining(", "));
             printInfo(collect);
             clearLine();
+        });
+
+        ACTION_MAP.put("set", (param, client) -> {
+            if (param.length == 1) {
+                KafkaToolConfig.printAll();
+            } else {
+                if (param.length < 3) {
+                    printInfo("请输入选项名称和要修改的选项值");
+                    return;
+                }
+                KafkaToolConfig.setConfig(param[1], param[2]);
+            }
         });
     }
 
